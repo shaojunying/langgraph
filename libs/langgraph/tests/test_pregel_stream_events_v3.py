@@ -497,6 +497,45 @@ class TestStreamV2Sync:
             _ = next(iter(run.values))
         assert run._exhausted is True
 
+    def test_transformer_error_closes_graph_iterator(self) -> None:
+        """A transformer error must close the suspended graph generator."""
+
+        class State(TypedDict):
+            n: int
+
+        class RejectCustom(StreamTransformer):
+            required_stream_modes = ("custom",)
+
+            def init(self) -> dict:
+                return {}
+
+            def process(self, event: ProtocolEvent) -> bool:
+                if event["method"] == "custom":
+                    raise ValueError("transformer rejected event")
+                return True
+
+        def worker(state: State, writer: StreamWriter) -> dict:
+            writer({"progress": "starting"})
+            return {"n": state["n"] + 1}
+
+        graph = (
+            StateGraph(State)
+            .add_node("worker", worker)
+            .add_edge(START, "worker")
+            .add_edge("worker", END)
+            .compile()
+        )
+
+        run = graph.stream_events({"n": 0}, version="v3", transformers=[RejectCustom])
+        graph_iter = run._graph_iter
+        with pytest.raises(ValueError, match="transformer rejected event"):
+            run.output
+        # The generator is finished, not left suspended for the GC.
+        assert graph_iter.gi_frame is None
+        run.abort()  # still safe and idempotent after the error
+        with pytest.raises(ValueError, match="transformer rejected event"):
+            run.output
+
     def test_interleave_unknown_projection(self) -> None:
         run = _build_simple_graph().stream_events(
             {"value": "x", "items": []}, version="v3"
@@ -764,6 +803,68 @@ class TestStreamV2Async:
                 await consumer
             except asyncio.CancelledError:
                 pass
+
+    @NEEDS_CONTEXTVARS
+    async def test_transformer_error_cancels_running_node(self) -> None:
+        """A transformer error must not leave graph nodes running.
+
+        The error is raised by the mux, not by the graph, so the graph
+        generator is still suspended at a yield with the node task in
+        flight. The pump must close it, and a later `abort()` must not
+        be a silent no-op that leaves the node alive.
+        """
+
+        class State(TypedDict):
+            n: int
+
+        class RejectCustom(StreamTransformer):
+            required_stream_modes = ("custom",)
+
+            def init(self) -> dict:
+                return {}
+
+            def process(self, event: ProtocolEvent) -> bool:
+                if event["method"] == "custom":
+                    raise ValueError("transformer rejected event")
+                return True
+
+        marks: list[str] = []
+        gate = asyncio.Event()
+
+        async def worker(state: State, writer: StreamWriter) -> dict:
+            marks.append("started")
+            writer({"progress": "starting"})
+            try:
+                await gate.wait()
+                marks.append("SIDE_EFFECT")
+                return {"n": state["n"] + 1}
+            except asyncio.CancelledError:
+                marks.append("cancelled")
+                raise
+
+        graph = (
+            StateGraph(State)
+            .add_node("worker", worker)
+            .add_edge(START, "worker")
+            .add_edge("worker", END)
+            .compile()
+        )
+
+        run = await graph.astream_events(
+            {"n": 0}, version="v3", transformers=[RejectCustom]
+        )
+        # No `async with` and no abort(): the error alone must stop the node.
+        with pytest.raises(ValueError, match="transformer rejected event"):
+            await run.output()
+        assert marks == ["started", "cancelled"]
+
+        await run.abort()  # still safe and idempotent after the error
+        gate.set()
+        await asyncio.sleep(0.05)
+        assert marks == ["started", "cancelled"]
+        # The original error is preserved for later readers.
+        with pytest.raises(ValueError, match="transformer rejected event"):
+            await run.output()
 
     async def test_extensions_has_native_keys(self) -> None:
         run = await _build_simple_graph().astream_events(

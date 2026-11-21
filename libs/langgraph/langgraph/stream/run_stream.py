@@ -33,6 +33,28 @@ async def _adrive_until_done(pump: Callable[[], Awaitable[bool]]) -> None:
         pass
 
 
+def _close_graph_iter(graph_iter: Iterator[Any] | None) -> None:
+    """Close a suspended graph generator, ignoring errors from cleanup.
+
+    Closing raises `GeneratorExit` at the generator's current `yield`,
+    which unwinds the Pregel loop and cancels its in-flight tasks.
+    """
+    if graph_iter is not None and (close := getattr(graph_iter, "close", None)):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+async def _aclose_graph_iter(graph_aiter: AsyncIterator[Any] | None) -> None:
+    """Async counterpart of `_close_graph_iter`."""
+    if graph_aiter is not None and (aclose := getattr(graph_aiter, "aclose", None)):
+        try:
+            await aclose()
+        except Exception:
+            pass
+
+
 def _raise_missing_projection(run: object, name: str) -> NoReturn:
     """Raise after normal attribute lookup fails for a projection.
 
@@ -180,6 +202,12 @@ class GraphRunStream:
         except Exception as e:
             self._mux.fail(e)
             self._exhausted = True
+            # The error can come from the mux (a transformer's `process`)
+            # rather than from the graph. The graph generator is then still
+            # suspended at a `yield`, and `abort()` will no longer close it
+            # because the stream is already exhausted. Close it here.
+            graph_iter, self._graph_iter = self._graph_iter, None
+            _close_graph_iter(graph_iter)
             return False
 
     def abort(self) -> None:
@@ -194,14 +222,7 @@ class GraphRunStream:
         self._exhausted = True
         graph_iter = self._graph_iter
         self._graph_iter = None
-        if (
-            graph_iter is not None
-            and (close := getattr(graph_iter, "close", None)) is not None
-        ):
-            try:
-                close()
-            except Exception:
-                pass
+        _close_graph_iter(graph_iter)
         try:
             self._mux.close()
         except Exception:
@@ -520,7 +541,18 @@ class AsyncGraphRunStream:
                 return False
             except Exception as e:
                 self._exhausted = True
-                await self._mux.afail(e)
+                graph_aiter, self._graph_aiter = self._graph_aiter, None
+                # The error can come from the mux (a transformer's
+                # `aprocess`) rather than from the graph. The graph
+                # generator is then still suspended at a `yield` while its
+                # node tasks keep running on the event loop, and `abort()`
+                # will no longer close it because the stream is already
+                # exhausted. Close it before failing the mux, so no reader
+                # sees the error while a node is still running.
+                try:
+                    await _aclose_graph_iter(graph_aiter)
+                finally:
+                    await self._mux.afail(e)
                 return False
         finally:
             async with self._pump_cond:
@@ -556,14 +588,7 @@ class AsyncGraphRunStream:
                 await anext_task
             except (asyncio.CancelledError, Exception):
                 pass
-        if (
-            graph_aiter is not None
-            and (aclose := getattr(graph_aiter, "aclose", None)) is not None
-        ):
-            try:
-                await aclose()
-            except Exception:
-                pass
+        await _aclose_graph_iter(graph_aiter)
         try:
             await self._mux.aclose()
         except Exception:
